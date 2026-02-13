@@ -71,8 +71,16 @@ class Settings(BaseSettings):
                 "sender_patterns": [
                     "@bancolombia.com.co",
                     "@notificaciones.bancolombia.com.co",
+                    "alertasynotificaciones@an.notificacionesbancolombia.com",
                 ],
-                "subject_patterns": ["Movimiento", "Transaccion", "Transacción", "Pago", "Transferencia"],
+                "subject_patterns": [
+                    "Alertas y Notificaciones",
+                    "Movimiento",
+                    "Transaccion",
+                    "Transacción",
+                    "Pago",
+                    "Transferencia",
+                ],
                 "enabled": True,
             },
             "trading_newsletter": {

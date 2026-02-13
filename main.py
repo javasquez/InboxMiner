@@ -2,7 +2,7 @@
 Main entry point for the Email Inbox Miner application.
 Demonstrates basic usage of the email extraction system.
 """
-from datetime import date, timedelta
+from datetime import date
 
 from loguru import logger
 
@@ -24,14 +24,15 @@ def main():
 
         logger.info("Starting Bancolombia email extraction")
 
+        # IMAP SINCE is inclusive, so this means >= 2025-01-01
         date_filter = {
             "operator": ">",
-            "date": date.today() - timedelta(days=30),
+            "date": date(2025, 1, 1),
         }
 
         extracted_count = extractor.extract_emails(
-            sender="@bancolombia.com.co",
-            subject="Movimiento",
+            sender="alertasynotificaciones@an.notificacionesbancolombia.com",
+            subject="Alertas y Notificaciones",
             date_filter=date_filter,
             processor_type="bancolombia",
         )
