@@ -13,27 +13,27 @@ A scalable Python application for extracting, processing, and analyzing emails f
 
 ## Project Structure
 
-```
+```text
 email_inbox_miner/
-├── src/
-│   ├── core/                 # Core business logic
-│   │   └── email_extractor.py
-│   ├── connectors/          # Email connection handlers
-│   │   └── email_connector.py
-│   ├── database/            # Database management
-│   │   └── connection.py
-│   ├── models/              # Data models
-│   │   └── email.py
-│   └── utils/               # Utility functions
-│       └── logging.py
-├── config/                  # Configuration files
-│   └── settings.py
-├── tests/                   # Unit tests
-├── data/                    # Database files
-├── logs/                    # Application logs
-├── requirements.txt
-├── .env.example
-└── main.py
+|-- src/
+|   |-- core/                 # Core business logic
+|   |   `-- email_extractor.py
+|   |-- connectors/           # Email connection handlers
+|   |   `-- email_connector.py
+|   |-- database/             # Database management
+|   |   `-- connection.py
+|   |-- models/               # Data models
+|   |   `-- email.py
+|   `-- utils/                # Utility functions
+|       `-- logging.py
+|-- config/                   # Configuration files
+|   `-- settings.py
+|-- tests/                    # Unit tests
+|-- data/                     # Database files
+|-- logs/                     # Application logs
+|-- requirements.txt
+|-- .env.example
+`-- main.py
 ```
 
 ## Setup
@@ -44,10 +44,15 @@ email_inbox_miner/
    ```
 
 2. **Configure Environment**:
-   Copy `.env.example` to `.env` and update with your email credentials:
+   Copy `.env.example` to `.env` and update with your email and Microsoft app values:
    ```bash
+   EMAIL_HOST=outlook.office365.com
+   EMAIL_PORT=993
    EMAIL_USER=your_email@hotmail.com
-   EMAIL_PASSWORD=your_app_password
+   MS_CLIENT_ID=your_azure_app_client_id
+   MS_TENANT_ID=consumers
+   MS_SCOPES=https://outlook.office.com/IMAP.AccessAsUser.All offline_access
+   MS_TOKEN_CACHE_FILE=./data/msal_token_cache.json
    ```
 
 3. **Run the Application**:
@@ -88,8 +93,8 @@ date_filter = {"operator": ">", "date": date(2024, 1, 1)}
 
 # Date range
 date_filter = {
-    "operator": "range", 
-    "start_date": date(2024, 1, 1), 
+    "operator": "range",
+    "start_date": date(2024, 1, 1),
     "end_date": date(2024, 1, 31)
 }
 ```
@@ -127,7 +132,9 @@ date_filter = {
 
 ## Security Notes
 
-- Use app-specific passwords for email authentication
+- Uses Microsoft OAuth2 (`MSAL`) with IMAP `XOAUTH2` authentication
+- `MS_SCOPES` must include `https://outlook.office.com/IMAP.AccessAsUser.All`
+- Tokens are cached in `MS_TOKEN_CACHE_FILE` to avoid interactive login each run
 - Store credentials in environment variables, never in code
 - The `.env` file is git-ignored by default
 

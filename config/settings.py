@@ -14,7 +14,6 @@ class EmailSettings(BaseSettings):
     host: str = Field(default="outlook.office365.com", description="IMAP server host")
     port: int = Field(default=993, description="IMAP server port")
     user: str = Field(default="", description="Email username")
-    password: str = Field(default="", description="Email password or app password")
     use_ssl: bool = Field(default=True, description="Use SSL connection")
 
     class Config:
@@ -29,6 +28,24 @@ class DatabaseSettings(BaseSettings):
 
     class Config:
         env_prefix = "DATABASE_"
+
+
+class MicrosoftAuthSettings(BaseSettings):
+    """Microsoft OAuth settings for IMAP XOAUTH2."""
+
+    tenant_id: str = Field(default="consumers", description="Azure tenant ID")
+    client_id: str = Field(default="", description="Azure app client ID")
+    scopes: str = Field(
+        default="https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
+        description="OAuth scopes (space or comma separated)",
+    )
+    token_cache_file: str = Field(
+        default="./data/msal_token_cache.json",
+        description="Path to persisted MSAL token cache file",
+    )
+
+    class Config:
+        env_prefix = "MS_"
 
 
 class LoggingSettings(BaseSettings):
@@ -60,6 +77,7 @@ class Settings(BaseSettings):
     """Main settings class combining all configurations."""
 
     email: EmailSettings = EmailSettings()
+    microsoft_auth: MicrosoftAuthSettings = MicrosoftAuthSettings()
     database: DatabaseSettings = DatabaseSettings()
     logging: LoggingSettings = LoggingSettings()
     app: AppSettings = AppSettings()
@@ -98,4 +116,3 @@ class Settings(BaseSettings):
 
 # Global settings instance
 settings = Settings()
-

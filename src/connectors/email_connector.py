@@ -5,11 +5,14 @@ Designed to be extensible for different email providers.
 """
 import email
 import imaplib
+import re
 import ssl
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+import msal
 from loguru import logger
 
 from config.settings import settings
@@ -35,16 +38,65 @@ class EmailConnector:
     """
 
     def __init__(self):
-        self.connection: Optional[imaplib.IMAP4_SSL] = None
+        self.connection: Optional[imaplib.IMAP4] = None
         self.email_settings = settings.email
+        self.ms_settings = settings.microsoft_auth
+
+    @staticmethod
+    def _parse_scopes(scopes_value: str) -> List[str]:
+        """Parse scopes from comma or whitespace separated string."""
+        return [scope for scope in re.split(r"[\s,]+", scopes_value.strip()) if scope]
+
+    def _acquire_microsoft_access_token(self) -> str:
+        """Acquire Microsoft OAuth access token using device code flow."""
+        if not self.ms_settings.client_id:
+            raise ValueError("MS_CLIENT_ID must be configured before connecting")
+
+        authority = f"https://login.microsoftonline.com/{self.ms_settings.tenant_id}"
+        scopes = self._parse_scopes(self.ms_settings.scopes)
+        if not scopes:
+            raise ValueError("MS_SCOPES must include at least one scope")
+
+        token_cache = msal.SerializableTokenCache()
+        cache_file = Path(self.ms_settings.token_cache_file)
+        if cache_file.exists():
+            token_cache.deserialize(cache_file.read_text(encoding="utf-8"))
+
+        app = msal.PublicClientApplication(
+            client_id=self.ms_settings.client_id,
+            authority=authority,
+            token_cache=token_cache,
+        )
+
+        token_result: Optional[Dict[str, Any]] = None
+        accounts = app.get_accounts(username=self.email_settings.user)
+        if accounts:
+            token_result = app.acquire_token_silent(scopes=scopes, account=accounts[0])
+
+        if not token_result or "access_token" not in token_result:
+            flow = app.initiate_device_flow(scopes=scopes)
+            if "user_code" not in flow:
+                raise RuntimeError("Failed to start device code flow for Microsoft login")
+
+            logger.info(flow["message"])
+            token_result = app.acquire_token_by_device_flow(flow)
+
+        access_token = token_result.get("access_token")
+        if not access_token:
+            error_message = token_result.get("error_description") or str(token_result)
+            raise RuntimeError(f"Microsoft token acquisition failed: {error_message}")
+
+        if token_cache.has_state_changed:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(token_cache.serialize(), encoding="utf-8")
+
+        return access_token
 
     def connect(self) -> None:
         """Establish connection to the email server."""
         try:
-            if not self.email_settings.user or not self.email_settings.password:
-                raise ValueError(
-                    "EMAIL_USER and EMAIL_PASSWORD must be configured before connecting"
-                )
+            if not self.email_settings.user:
+                raise ValueError("EMAIL_USER must be configured before connecting")
 
             if self.email_settings.use_ssl:
                 context = ssl.create_default_context()
@@ -59,8 +111,15 @@ class EmailConnector:
                     self.email_settings.port,
                 )
 
-            self.connection.login(self.email_settings.user, self.email_settings.password)
-            self.connection.select("INBOX")
+            access_token = self._acquire_microsoft_access_token()
+            auth_string = (
+                f"user={self.email_settings.user}\x01"
+                f"auth=Bearer {access_token}\x01\x01"
+            ).encode("utf-8")
+            self.connection.authenticate("XOAUTH2", lambda _: auth_string)
+            status, _ = self.connection.select("INBOX")
+            if status != "OK":
+                raise RuntimeError("Failed to select INBOX after authentication")
             logger.info(f"Connected to email server: {self.email_settings.host}")
 
         except Exception as e:
