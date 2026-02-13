@@ -1,7 +1,7 @@
 # Core Dependencies for Email Processing
-# imaplib is built-in with Python
 email-validator>=2.1.0
 python-dotenv>=1.0.0
+requests>=2.31.0
 
 # Database
 sqlalchemy>=2.0.0

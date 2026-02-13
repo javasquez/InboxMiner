@@ -1,18 +1,16 @@
 """
-Email connector for IMAP-based email retrieval.
+Email connector for Microsoft Graph-based email retrieval.
 Supports filtering by sender, subject, and date ranges.
 Designed to be extensible for different email providers.
 """
-import email
-import imaplib
 import re
-import ssl
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import msal
+import requests
 from loguru import logger
 
 from config.settings import settings
@@ -33,14 +31,15 @@ class EmailFilter:
 
 class EmailConnector:
     """
-    IMAP email connector for retrieving emails from inbox.
-    Supports hotmail/outlook and can be extended for other providers.
+    Microsoft Graph email connector for retrieving inbox emails.
+    Supports Outlook/Hotmail accounts via delegated OAuth2.
     """
 
     def __init__(self):
-        self.connection: Optional[imaplib.IMAP4] = None
+        self.connection: Optional[requests.Session] = None
         self.email_settings = settings.email
         self.ms_settings = settings.microsoft_auth
+        self._graph_base_url = "https://graph.microsoft.com/v1.0"
 
     @staticmethod
     def _parse_scopes(scopes_value: str) -> List[str]:
@@ -92,46 +91,98 @@ class EmailConnector:
 
         return access_token
 
+    @staticmethod
+    def _build_date_range(
+        email_filter: "EmailFilter",
+    ) -> Tuple[Optional[datetime], Optional[datetime]]:
+        """Build UTC date range [start, end) from the filter if present."""
+        if not email_filter.date_filter:
+            return None, None
+
+        date_filter = email_filter.date_filter
+        operator = date_filter.get("operator")
+
+        if operator == "=":
+            target_date = EmailConnector._normalize_date(date_filter["date"])
+            start = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+            end = start + timedelta(days=1)
+            return start, end
+
+        if operator == ">":
+            target_date = EmailConnector._normalize_date(date_filter["date"])
+            start = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+            return start, None
+
+        if operator == "range":
+            start_date = EmailConnector._normalize_date(date_filter["start_date"])
+            end_date = EmailConnector._normalize_date(date_filter["end_date"])
+            start = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+            end = (
+                datetime.combine(end_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+                + timedelta(days=1)
+            )
+            return start, end
+
+        return None, None
+
+    @staticmethod
+    def _matches_text_filters(message: Dict[str, Any], email_filter: "EmailFilter") -> bool:
+        """Apply sender/subject filters on a Graph message payload."""
+        if email_filter.sender:
+            sender = (
+                message.get("from", {})
+                .get("emailAddress", {})
+                .get("address", "")
+                .lower()
+            )
+            if email_filter.sender.lower() not in sender:
+                return False
+
+        if email_filter.subject:
+            subject = (message.get("subject") or "").lower()
+            if email_filter.subject.lower() not in subject:
+                return False
+
+        return True
+
+    @staticmethod
+    def _iso_utc(dt: datetime) -> str:
+        """Return Graph-compatible ISO8601 UTC string without microseconds."""
+        return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
     def connect(self) -> None:
-        """Establish connection to the email server."""
+        """Establish authenticated Microsoft Graph session."""
         try:
             if not self.email_settings.user:
                 raise ValueError("EMAIL_USER must be configured before connecting")
 
-            if self.email_settings.use_ssl:
-                context = ssl.create_default_context()
-                self.connection = imaplib.IMAP4_SSL(
-                    self.email_settings.host,
-                    self.email_settings.port,
-                    ssl_context=context,
-                )
-            else:
-                self.connection = imaplib.IMAP4(
-                    self.email_settings.host,
-                    self.email_settings.port,
-                )
-
             access_token = self._acquire_microsoft_access_token()
-            auth_string = (
-                f"user={self.email_settings.user}\x01"
-                f"auth=Bearer {access_token}\x01\x01"
-            ).encode("utf-8")
-            self.connection.authenticate("XOAUTH2", lambda _: auth_string)
-            status, _ = self.connection.select("INBOX")
-            if status != "OK":
-                raise RuntimeError("Failed to select INBOX after authentication")
-            logger.info(f"Connected to email server: {self.email_settings.host}")
+            session = requests.Session()
+            session.headers.update(
+                {
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/json",
+                }
+            )
+
+            health_response = session.get(
+                f"{self._graph_base_url}/me/mailFolders/inbox",
+                timeout=30,
+            )
+            health_response.raise_for_status()
+            self.connection = session
+            logger.info("Connected to Microsoft Graph mail API")
 
         except Exception as e:
-            logger.error(f"Failed to connect to email server: {e}")
+            logger.error(f"Failed to connect to Microsoft Graph: {e}")
             raise
 
     def disconnect(self) -> None:
-        """Close the connection to the email server."""
+        """Close the Graph session."""
         if self.connection:
             try:
-                self.connection.logout()
-                logger.info("Disconnected from email server")
+                self.connection.close()
+                logger.info("Disconnected from Microsoft Graph")
             except Exception as e:
                 logger.warning(f"Error during disconnect: {e}")
             finally:
@@ -142,46 +193,17 @@ class EmailConnector:
         """Normalize date or datetime input to date."""
         return value.date() if isinstance(value, datetime) else value
 
-    @staticmethod
-    def _quote_imap(value: str) -> str:
-        """Quote string values for IMAP search criteria."""
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
-
-    def _build_search_criteria(self, email_filter: EmailFilter) -> List[str]:
-        """Build IMAP search criteria from EmailFilter."""
+    def _build_graph_filter(self, email_filter: EmailFilter) -> Optional[str]:
+        """Build OData date filter for Graph requests."""
+        start, end = self._build_date_range(email_filter)
         criteria_parts: List[str] = []
-
-        if email_filter.sender:
-            criteria_parts.extend(["FROM", self._quote_imap(email_filter.sender)])
-
-        if email_filter.subject:
-            criteria_parts.extend(["SUBJECT", self._quote_imap(email_filter.subject)])
-
-        if email_filter.date_filter:
-            date_filter = email_filter.date_filter
-            operator = date_filter.get("operator")
-
-            if operator == "=":
-                target_date = self._normalize_date(date_filter["date"])
-                criteria_parts.extend(["ON", target_date.strftime("%d-%b-%Y")])
-
-            elif operator == ">":
-                target_date = self._normalize_date(date_filter["date"])
-                criteria_parts.extend(["SINCE", target_date.strftime("%d-%b-%Y")])
-
-            elif operator == "range":
-                start_date = self._normalize_date(date_filter["start_date"])
-                end_date = self._normalize_date(date_filter["end_date"])
-                # IMAP BEFORE is exclusive; add one day to make end_date inclusive.
-                end_exclusive = end_date + timedelta(days=1)
-                criteria_parts.extend(["SINCE", start_date.strftime("%d-%b-%Y")])
-                criteria_parts.extend(["BEFORE", end_exclusive.strftime("%d-%b-%Y")])
-
+        if start:
+            criteria_parts.append(f"receivedDateTime ge {self._iso_utc(start)}")
+        if end:
+            criteria_parts.append(f"receivedDateTime lt {self._iso_utc(end)}")
         if not criteria_parts:
-            criteria_parts.append("ALL")
-
-        return criteria_parts
+            return None
+        return " and ".join(criteria_parts)
 
     def search_emails(self, email_filter: EmailFilter) -> List[str]:
         """
@@ -191,84 +213,42 @@ class EmailConnector:
         if not self.connection:
             raise ConnectionError("Not connected to email server")
 
-        search_criteria = self._build_search_criteria(email_filter)
-        logger.info(f"Searching emails with criteria: {' '.join(search_criteria)}")
+        logger.info("Searching emails via Microsoft Graph")
 
         try:
-            status, message_ids = self.connection.search(None, *search_criteria)
-            if status != "OK":
-                raise Exception(f"Search failed: {status}")
+            params: Dict[str, str] = {
+                "$top": "100",
+                "$select": "id,subject,from,receivedDateTime",
+                "$orderby": "receivedDateTime desc",
+            }
+            graph_filter = self._build_graph_filter(email_filter)
+            if graph_filter:
+                params["$filter"] = graph_filter
 
-            if message_ids[0]:
-                ids = message_ids[0].split()
-                logger.info(f"Found {len(ids)} emails matching criteria")
-                return [msg_id.decode() for msg_id in ids]
+            next_url = f"{self._graph_base_url}/me/mailFolders/inbox/messages"
+            collected_ids: List[str] = []
 
-            logger.info("No emails found matching criteria")
-            return []
+            while next_url:
+                response = self.connection.get(next_url, params=params, timeout=30)
+                response.raise_for_status()
+                payload = response.json()
+                messages = payload.get("value", [])
+
+                for message in messages:
+                    if self._matches_text_filters(message, email_filter):
+                        msg_id = message.get("id")
+                        if msg_id:
+                            collected_ids.append(msg_id)
+
+                next_url = payload.get("@odata.nextLink")
+                params = {}
+
+            logger.info(f"Found {len(collected_ids)} emails matching criteria")
+            return collected_ids
 
         except Exception as e:
             logger.error(f"Error searching emails: {e}")
             raise
-
-    @staticmethod
-    def _decode_payload(part: email.message.Message, payload: Any) -> str:
-        """Decode email payload while respecting MIME charset."""
-        if payload is None:
-            return ""
-        if isinstance(payload, str):
-            return payload
-
-        charset = part.get_content_charset() or "utf-8"
-        for candidate in (charset, "utf-8", "latin-1"):
-            try:
-                return payload.decode(candidate, errors="replace")
-            except Exception:
-                continue
-        return payload.decode("utf-8", errors="ignore")
-
-    def _extract_bodies(self, email_message: email.message.Message) -> Dict[str, str]:
-        """Extract plain and HTML bodies while ignoring attachments."""
-        plain_parts: List[str] = []
-        html_parts: List[str] = []
-
-        if email_message.is_multipart():
-            for part in email_message.walk():
-                if part.is_multipart():
-                    continue
-
-                disposition = (part.get_content_disposition() or "").lower()
-                if disposition == "attachment":
-                    continue
-
-                content_type = part.get_content_type().lower()
-                if content_type not in {"text/plain", "text/html"}:
-                    continue
-
-                decoded = self._decode_payload(part, part.get_payload(decode=True)).strip()
-                if not decoded:
-                    continue
-
-                if content_type == "text/plain":
-                    plain_parts.append(decoded)
-                else:
-                    html_parts.append(decoded)
-        else:
-            content_type = email_message.get_content_type().lower()
-            decoded = self._decode_payload(
-                email_message,
-                email_message.get_payload(decode=True),
-            ).strip()
-            if decoded:
-                if content_type == "text/html":
-                    html_parts.append(decoded)
-                else:
-                    plain_parts.append(decoded)
-
-        return {
-            "body_plain": "\n\n".join(plain_parts),
-            "body_html": "\n\n".join(html_parts),
-        }
 
     def fetch_email(self, email_id: str) -> Dict[str, Any]:
         """
@@ -279,25 +259,53 @@ class EmailConnector:
             raise ConnectionError("Not connected to email server")
 
         try:
-            status, msg_data = self.connection.fetch(email_id, "(RFC822)")
-            if status != "OK" or not msg_data or msg_data[0] is None:
-                raise Exception(f"Fetch failed for email ID {email_id}: {status}")
+            response = self.connection.get(
+                f"{self._graph_base_url}/me/messages/{email_id}",
+                params={
+                    "$select": ",".join(
+                        [
+                            "id",
+                            "internetMessageId",
+                            "from",
+                            "subject",
+                            "receivedDateTime",
+                            "body",
+                            "bodyPreview",
+                            "internetMessageHeaders",
+                        ]
+                    )
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            message = response.json()
 
-            raw_email = msg_data[0][1]
-            email_message = email.message_from_bytes(raw_email)
-            bodies = self._extract_bodies(email_message)
+            body = message.get("body") or {}
+            content_type = (body.get("contentType") or "").lower()
+            content = body.get("content") or ""
+            body_html = content if content_type == "html" else ""
+            body_plain = (
+                message.get("bodyPreview")
+                if content_type == "html"
+                else content
+            ) or ""
 
             headers = "\n".join(
-                f"{header}: {value}" for header, value in email_message.items()
+                f"{header.get('name', '')}: {header.get('value', '')}"
+                for header in message.get("internetMessageHeaders", [])
             )
 
             return {
-                "message_id": email_message.get("Message-ID", f"generated-{email_id}"),
-                "sender": email_message.get("From", ""),
-                "subject": email_message.get("Subject", ""),
-                "received_date": self._parse_date(email_message.get("Date")),
-                "body_plain": bodies["body_plain"],
-                "body_html": bodies["body_html"],
+                "message_id": message.get("internetMessageId", f"generated-{email_id}"),
+                "sender": (
+                    message.get("from", {})
+                    .get("emailAddress", {})
+                    .get("address", "")
+                ),
+                "subject": message.get("subject", ""),
+                "received_date": self._parse_date(message.get("receivedDateTime")),
+                "body_plain": body_plain,
+                "body_html": body_html,
                 "raw_headers": headers,
             }
 
@@ -309,6 +317,15 @@ class EmailConnector:
         """Parse email date string to naive UTC datetime."""
         if not date_str:
             return datetime.utcnow()
+
+        try:
+            # Graph returns ISO8601 (e.g. 2026-02-13T18:40:00Z).
+            parsed_iso = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            if parsed_iso.tzinfo is not None:
+                return parsed_iso.astimezone(timezone.utc).replace(tzinfo=None)
+            return parsed_iso
+        except Exception:
+            pass
 
         try:
             from email.utils import parsedate_to_datetime

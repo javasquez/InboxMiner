@@ -4,7 +4,7 @@ A scalable Python application for extracting, processing, and analyzing emails f
 
 ## Features
 
-- **Email Extraction**: Connect to IMAP servers (Hotmail, Outlook, Gmail, etc.)
+- **Email Extraction**: Connect to Microsoft Graph Mail API (Outlook/Hotmail)
 - **Flexible Filtering**: Filter emails by sender, subject, and date ranges
 - **Scalable Architecture**: Easily extensible for different email processors
 - **Database Storage**: SQLite database for raw email storage and processing logs
@@ -51,7 +51,7 @@ email_inbox_miner/
    EMAIL_USER=your_email@hotmail.com
    MS_CLIENT_ID=your_azure_app_client_id
    MS_TENANT_ID=consumers
-   MS_SCOPES=https://outlook.office.com/IMAP.AccessAsUser.All offline_access
+   MS_SCOPES=Mail.Read offline_access
    MS_TOKEN_CACHE_FILE=./data/msal_token_cache.json
    ```
 
@@ -132,8 +132,8 @@ date_filter = {
 
 ## Security Notes
 
-- Uses Microsoft OAuth2 (`MSAL`) with IMAP `XOAUTH2` authentication
-- `MS_SCOPES` must include `https://outlook.office.com/IMAP.AccessAsUser.All`
+- Uses Microsoft OAuth2 (`MSAL`) with Microsoft Graph authentication
+- `MS_SCOPES` must include `Mail.Read`
 - Tokens are cached in `MS_TOKEN_CACHE_FILE` to avoid interactive login each run
 - Store credentials in environment variables, never in code
 - The `.env` file is git-ignored by default
@@ -149,7 +149,7 @@ date_filter = {
 ## Requirements
 
 - Python 3.8+
-- IMAP-enabled email account
+- Microsoft mailbox (Outlook/Hotmail) with Graph access
 - Internet connection for email access
 
 ## License

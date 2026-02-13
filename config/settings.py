@@ -31,12 +31,12 @@ class DatabaseSettings(BaseSettings):
 
 
 class MicrosoftAuthSettings(BaseSettings):
-    """Microsoft OAuth settings for IMAP XOAUTH2."""
+    """Microsoft OAuth settings for Graph API access."""
 
     tenant_id: str = Field(default="consumers", description="Azure tenant ID")
     client_id: str = Field(default="", description="Azure app client ID")
     scopes: str = Field(
-        default="https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
+        default="Mail.Read offline_access",
         description="OAuth scopes (space or comma separated)",
     )
     token_cache_file: str = Field(
