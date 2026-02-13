@@ -3,14 +3,14 @@ Email connector for IMAP-based email retrieval.
 Supports filtering by sender, subject, and date ranges.
 Designed to be extensible for different email providers.
 """
-import imaplib
 import email
+import imaplib
 import ssl
-from datetime import datetime, date
-from typing import List, Optional, Dict, Any, Tuple, Union
-from email.message import EmailMessage
-from loguru import logger
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Union
+
+from loguru import logger
 
 from config.settings import settings
 
@@ -18,6 +18,7 @@ from config.settings import settings
 @dataclass
 class EmailFilter:
     """Email filtering criteria."""
+
     sender: Optional[str] = None
     subject: Optional[str] = None
     date_filter: Optional[Dict[str, Union[str, date, datetime]]] = None
@@ -32,41 +33,40 @@ class EmailConnector:
     IMAP email connector for retrieving emails from inbox.
     Supports hotmail/outlook and can be extended for other providers.
     """
-    
+
     def __init__(self):
         self.connection: Optional[imaplib.IMAP4_SSL] = None
         self.email_settings = settings.email
-        
+
     def connect(self) -> None:
         """Establish connection to the email server."""
         try:
+            if not self.email_settings.user or not self.email_settings.password:
+                raise ValueError(
+                    "EMAIL_USER and EMAIL_PASSWORD must be configured before connecting"
+                )
+
             if self.email_settings.use_ssl:
                 context = ssl.create_default_context()
                 self.connection = imaplib.IMAP4_SSL(
-                    self.email_settings.host, 
+                    self.email_settings.host,
                     self.email_settings.port,
-                    ssl_context=context
+                    ssl_context=context,
                 )
             else:
                 self.connection = imaplib.IMAP4(
-                    self.email_settings.host, 
-                    self.email_settings.port
+                    self.email_settings.host,
+                    self.email_settings.port,
                 )
-            
-            # Login
-            self.connection.login(
-                self.email_settings.user, 
-                self.email_settings.password
-            )
-            
-            # Select inbox
-            self.connection.select('INBOX')
+
+            self.connection.login(self.email_settings.user, self.email_settings.password)
+            self.connection.select("INBOX")
             logger.info(f"Connected to email server: {self.email_settings.host}")
-            
+
         except Exception as e:
             logger.error(f"Failed to connect to email server: {e}")
             raise
-    
+
     def disconnect(self) -> None:
         """Close the connection to the email server."""
         if self.connection:
@@ -77,81 +77,140 @@ class EmailConnector:
                 logger.warning(f"Error during disconnect: {e}")
             finally:
                 self.connection = None
-    
-    def _build_search_criteria(self, email_filter: EmailFilter) -> str:
+
+    @staticmethod
+    def _normalize_date(value: Union[date, datetime]) -> date:
+        """Normalize date or datetime input to date."""
+        return value.date() if isinstance(value, datetime) else value
+
+    @staticmethod
+    def _quote_imap(value: str) -> str:
+        """Quote string values for IMAP search criteria."""
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+
+    def _build_search_criteria(self, email_filter: EmailFilter) -> List[str]:
         """Build IMAP search criteria from EmailFilter."""
-        criteria_parts = []
-        
-        # Sender filter
+        criteria_parts: List[str] = []
+
         if email_filter.sender:
-            criteria_parts.append(f'FROM "{email_filter.sender}"')
-        
-        # Subject filter
+            criteria_parts.extend(["FROM", self._quote_imap(email_filter.sender)])
+
         if email_filter.subject:
-            criteria_parts.append(f'SUBJECT "{email_filter.subject}"')
-        
-        # Date filter
+            criteria_parts.extend(["SUBJECT", self._quote_imap(email_filter.subject)])
+
         if email_filter.date_filter:
             date_filter = email_filter.date_filter
             operator = date_filter.get("operator")
-            
+
             if operator == "=":
-                target_date = date_filter["date"]
-                if isinstance(target_date, datetime):
-                    target_date = target_date.date()
-                criteria_parts.append(f'ON {target_date.strftime("%d-%b-%Y")}')
-                
+                target_date = self._normalize_date(date_filter["date"])
+                criteria_parts.extend(["ON", target_date.strftime("%d-%b-%Y")])
+
             elif operator == ">":
-                target_date = date_filter["date"]
-                if isinstance(target_date, datetime):
-                    target_date = target_date.date()
-                criteria_parts.append(f'SINCE {target_date.strftime("%d-%b-%Y")}')
-                
+                target_date = self._normalize_date(date_filter["date"])
+                criteria_parts.extend(["SINCE", target_date.strftime("%d-%b-%Y")])
+
             elif operator == "range":
-                start_date = date_filter["start_date"]
-                end_date = date_filter["end_date"]
-                if isinstance(start_date, datetime):
-                    start_date = start_date.date()
-                if isinstance(end_date, datetime):
-                    end_date = end_date.date()
-                criteria_parts.append(f'SINCE {start_date.strftime("%d-%b-%Y")}')
-                criteria_parts.append(f'BEFORE {end_date.strftime("%d-%b-%Y")}')
-        
-        # If no criteria, search all emails (be careful with this)
+                start_date = self._normalize_date(date_filter["start_date"])
+                end_date = self._normalize_date(date_filter["end_date"])
+                # IMAP BEFORE is exclusive; add one day to make end_date inclusive.
+                end_exclusive = end_date + timedelta(days=1)
+                criteria_parts.extend(["SINCE", start_date.strftime("%d-%b-%Y")])
+                criteria_parts.extend(["BEFORE", end_exclusive.strftime("%d-%b-%Y")])
+
         if not criteria_parts:
-            criteria_parts.append('ALL')
-        
-        return ' '.join(criteria_parts)
-    
+            criteria_parts.append("ALL")
+
+        return criteria_parts
+
     def search_emails(self, email_filter: EmailFilter) -> List[str]:
         """
         Search for emails matching the given criteria.
-        Returns list of email UIDs.
+        Returns list of email IDs.
         """
         if not self.connection:
             raise ConnectionError("Not connected to email server")
-        
+
         search_criteria = self._build_search_criteria(email_filter)
-        logger.info(f"Searching emails with criteria: {search_criteria}")
-        
+        logger.info(f"Searching emails with criteria: {' '.join(search_criteria)}")
+
         try:
-            status, message_ids = self.connection.search(None, search_criteria)
-            if status != 'OK':
+            status, message_ids = self.connection.search(None, *search_criteria)
+            if status != "OK":
                 raise Exception(f"Search failed: {status}")
-            
-            # Parse message IDs
+
             if message_ids[0]:
                 ids = message_ids[0].split()
                 logger.info(f"Found {len(ids)} emails matching criteria")
-                return [id.decode() for id in ids]
-            else:
-                logger.info("No emails found matching criteria")
-                return []
-                
+                return [msg_id.decode() for msg_id in ids]
+
+            logger.info("No emails found matching criteria")
+            return []
+
         except Exception as e:
             logger.error(f"Error searching emails: {e}")
             raise
-    
+
+    @staticmethod
+    def _decode_payload(part: email.message.Message, payload: Any) -> str:
+        """Decode email payload while respecting MIME charset."""
+        if payload is None:
+            return ""
+        if isinstance(payload, str):
+            return payload
+
+        charset = part.get_content_charset() or "utf-8"
+        for candidate in (charset, "utf-8", "latin-1"):
+            try:
+                return payload.decode(candidate, errors="replace")
+            except Exception:
+                continue
+        return payload.decode("utf-8", errors="ignore")
+
+    def _extract_bodies(self, email_message: email.message.Message) -> Dict[str, str]:
+        """Extract plain and HTML bodies while ignoring attachments."""
+        plain_parts: List[str] = []
+        html_parts: List[str] = []
+
+        if email_message.is_multipart():
+            for part in email_message.walk():
+                if part.is_multipart():
+                    continue
+
+                disposition = (part.get_content_disposition() or "").lower()
+                if disposition == "attachment":
+                    continue
+
+                content_type = part.get_content_type().lower()
+                if content_type not in {"text/plain", "text/html"}:
+                    continue
+
+                decoded = self._decode_payload(part, part.get_payload(decode=True)).strip()
+                if not decoded:
+                    continue
+
+                if content_type == "text/plain":
+                    plain_parts.append(decoded)
+                else:
+                    html_parts.append(decoded)
+        else:
+            content_type = email_message.get_content_type().lower()
+            decoded = self._decode_payload(
+                email_message,
+                email_message.get_payload(decode=True),
+            ).strip()
+            if decoded:
+                if content_type == "text/html":
+                    html_parts.append(decoded)
+                else:
+                    plain_parts.append(decoded)
+
+        return {
+            "body_plain": "\n\n".join(plain_parts),
+            "body_html": "\n\n".join(html_parts),
+        }
+
     def fetch_email(self, email_id: str) -> Dict[str, Any]:
         """
         Fetch a single email by ID and return parsed data.
@@ -159,75 +218,55 @@ class EmailConnector:
         """
         if not self.connection:
             raise ConnectionError("Not connected to email server")
-        
+
         try:
-            # Fetch the email
-            status, msg_data = self.connection.fetch(email_id, '(RFC822)')
-            if status != 'OK':
+            status, msg_data = self.connection.fetch(email_id, "(RFC822)")
+            if status != "OK" or not msg_data or msg_data[0] is None:
                 raise Exception(f"Fetch failed for email ID {email_id}: {status}")
-            
-            # Parse the email
+
             raw_email = msg_data[0][1]
             email_message = email.message_from_bytes(raw_email)
-            
-            # Extract email components
-            email_data = {
-                'message_id': email_message.get('Message-ID', f'generated-{email_id}'),
-                'sender': email_message.get('From', ''),
-                'subject': email_message.get('Subject', ''),
-                'received_date': self._parse_date(email_message.get('Date')),
-                'body_plain': '',
-                'body_html': '',
-                'raw_headers': str(email_message),
+            bodies = self._extract_bodies(email_message)
+
+            headers = "\n".join(
+                f"{header}: {value}" for header, value in email_message.items()
+            )
+
+            return {
+                "message_id": email_message.get("Message-ID", f"generated-{email_id}"),
+                "sender": email_message.get("From", ""),
+                "subject": email_message.get("Subject", ""),
+                "received_date": self._parse_date(email_message.get("Date")),
+                "body_plain": bodies["body_plain"],
+                "body_html": bodies["body_html"],
+                "raw_headers": headers,
             }
-            
-            # Extract body content
-            if email_message.is_multipart():
-                for part in email_message.walk():
-                    content_type = part.get_content_type()
-                    if content_type == 'text/plain':
-                        body = part.get_payload(decode=True)
-                        if body:
-                            email_data['body_plain'] = body.decode('utf-8', errors='ignore')
-                    elif content_type == 'text/html':
-                        body = part.get_payload(decode=True)
-                        if body:
-                            email_data['body_html'] = body.decode('utf-8', errors='ignore')
-            else:
-                # Single part message
-                body = email_message.get_payload(decode=True)
-                if body:
-                    content_type = email_message.get_content_type()
-                    body_text = body.decode('utf-8', errors='ignore')
-                    if content_type == 'text/html':
-                        email_data['body_html'] = body_text
-                    else:
-                        email_data['body_plain'] = body_text
-            
-            return email_data
-            
+
         except Exception as e:
             logger.error(f"Error fetching email ID {email_id}: {e}")
             raise
-    
+
     def _parse_date(self, date_str: Optional[str]) -> datetime:
-        """Parse email date string to datetime object."""
+        """Parse email date string to naive UTC datetime."""
         if not date_str:
             return datetime.utcnow()
-        
+
         try:
-            # Use email.utils to parse the date
             from email.utils import parsedate_to_datetime
-            return parsedate_to_datetime(date_str)
+
+            parsed = parsedate_to_datetime(date_str)
+            if parsed.tzinfo is not None:
+                return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            return parsed
         except Exception:
             logger.warning(f"Could not parse date: {date_str}")
             return datetime.utcnow()
-    
+
     def __enter__(self):
         """Context manager entry."""
         self.connect()
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit."""
         self.disconnect()
